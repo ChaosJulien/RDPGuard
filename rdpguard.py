@@ -1,22 +1,22 @@
 # RDPGuard - RDP 爆破检测与自动封禁工具
 # 作者: ChaosJulien
-# 
+#
 # ⚠️ 免责声明: 本工具可能修改系统防火墙规则，存在误封风险。
 #    请在测试环境充分验证后再用于生产。作者不承担任何使用后果。
-# 
+#
 # License: MIT
 
 """
-RDPGuard (rewritten)
-- Read Huorong log.db snapshots
-- Extract RDP brute-force (fname=rlogin, detection=RDP)
-- Persist events/stats/bans in state.db
-- Auto block via Windows Firewall
-  * Permanent bans: ONE aggregated rule (fast)
-  * Temporary bans: per-IP rules (auto unban when expired)
-- Generate report.html (+ optional charts if matplotlib installed)
+RDPGuard - RDP 爆破检测与自动封禁工具
+- 读取火绒 log.db 的“快照副本”（避免数据库被占用导致读取失败）
+- 提取 RDP 爆破（fname=rlogin, detail.detail.detection=RDP）
+- 将事件/统计/封禁记录持久化到 state.db
+- 自动通过 Windows 防火墙封禁
+  * 永久封禁：使用“一个聚合规则”合并大量 IP（性能更好）
+  * 临时封禁：按 IP 单独规则（到期自动解封）
+- 生成 report.html（若安装 matplotlib 可额外生成图表）
 
-Run as Administrator.
+必须使用【管理员】运行。
 """
 
 import os
@@ -31,17 +31,17 @@ from pathlib import Path
 from datetime import datetime
 
 # =========================
-# Config (edit if needed)
+# 配置（按需修改）
 # =========================
 
-# Huorong DB (confirmed in your environment)
+# 火绒数据库路径（与你环境一致）
 HUORONG_DIR = Path(r"C:\ProgramData\Huorong\Sysdiag")
 LOG_DB = HUORONG_DIR / "log.db"
 LOG_DB_WAL = HUORONG_DIR / "log.db-wal"
 LOG_DB_SHM = HUORONG_DIR / "log.db-shm"
-HUORONG_TABLE = "HrLogV3_60"  # your table
+HUORONG_TABLE = "HrLogV3_60"  # 火绒日志表名（你的环境是这个）
 
-# RDPGuard working dir
+# RDPGuard 工作目录
 BASE = Path(r"C:\ProgramData\RDPGuard")
 STATE_DB = BASE / "state.db"
 LOG_FILE = BASE / "rdpguard.log"
@@ -50,40 +50,47 @@ CHART_TOP = BASE / "top_ips.png"
 CHART_DAILY = BASE / "daily_hits.png"
 SNAP_DIR = BASE / "snapshots"
 
-# Firewall naming
-RULE_PREFIX_TEMP = "RDPGuard"  # per-IP temporary rules: "RDPGuard <ip>"
-RULE_POOL_NAME = "RDPGuard-Blocked-IP-Pool"  # aggregated permanent ban rule
+# 快照保留策略：只保留最近 N 个快照（避免无限增长）
+SNAPSHOT_KEEP_MAX = 50  # 建议：每分钟跑一次可设 200；每 5 分钟跑一次 50~100 也够用
 
-# Retention
-EVENT_RETENTION_DAYS = 30  # keep events in state.db for last N days
+# 防火墙规则命名
+RULE_PREFIX_TEMP = "RDPGuard"  # 临时封禁（单 IP 规则）：DisplayName="RDPGuard <ip>"
+RULE_POOL_NAME = "RDPGuard-Blocked-IP-Pool"  # 永久封禁（聚合规则）：DisplayName=该名字（必要时拆分 -1/-2/...）
 
-# Ban policy
+# 事件保留：state.db 中 events 表只保留最近 N 天（用于窗口统计/报表）
+EVENT_RETENTION_DAYS = 30
+
+# 封禁策略
 THRESH_10M = 5
 BAN_10M_HOURS = 24
 
 THRESH_1D = 20
 BAN_1D_DAYS = 7
 
-THRESH_TOTAL = 100  # permanent ban threshold
+THRESH_TOTAL = 100  # 达到累计次数则永久封禁
 
-# Parsing helpers
+# IP 提取正则
 RE_IP = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b")
 
 # =========================
-# Utilities
+# 工具函数
 # =========================
 
 def now_ts() -> int:
+    """当前 Unix 时间戳（秒）"""
     return int(time.time())
 
 def ts_to_local_str(ts: int) -> str:
+    """时间戳转本地时间字符串"""
     return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
 
 def ensure_dirs():
+    """确保工作目录存在"""
     BASE.mkdir(parents=True, exist_ok=True)
     SNAP_DIR.mkdir(parents=True, exist_ok=True)
 
 def append_log(msg: str):
+    """写日志到文件 + 控制台输出"""
     ensure_dirs()
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
     try:
@@ -94,20 +101,57 @@ def append_log(msg: str):
     print(msg)
 
 def is_admin() -> bool:
-    # net session requires admin
-    p = subprocess.run(["powershell", "-NoProfile", "-Command", "net session"],
-                       capture_output=True, text=True)
+    """判断是否管理员权限（net session 需要管理员）"""
+    p = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", "net session"],
+        capture_output=True, text=True
+    )
     return p.returncode == 0
 
 def run_ps(cmd: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
-                          capture_output=True, text=True)
+    """运行 PowerShell 命令"""
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-Command", cmd],
+        capture_output=True, text=True
+    )
+
+def cleanup_snapshots_keep_last_n():
+    """
+    快照清理：只保留最近 SNAPSHOT_KEEP_MAX 个快照目录。
+    仅删除目录名符合 YYYYMMDD_HHMMSS 的目录，避免误删其他文件夹。
+    """
+    if not SNAP_DIR.exists():
+        return
+
+    items = []
+    for p in SNAP_DIR.iterdir():
+        if not p.is_dir():
+            continue
+        try:
+            dt = datetime.strptime(p.name, "%Y%m%d_%H%M%S")
+            ts = int(dt.timestamp())
+            items.append((ts, p))
+        except Exception:
+            # 非标准命名目录不动，避免误删
+            continue
+
+    # 新->旧
+    items.sort(key=lambda x: x[0], reverse=True)
+
+    # 超出 N 的删掉
+    for _, p in items[SNAPSHOT_KEEP_MAX:]:
+        try:
+            shutil.rmtree(p, ignore_errors=True)
+            append_log(f"SNAP_CLEAN 已删除旧快照：{p.name}")
+        except Exception as e:
+            append_log(f"SNAP_CLEAN 删除失败：{p.name}，错误：{e}")
 
 # =========================
-# DB: state.db
+# 数据库：state.db
 # =========================
 
 def ensure_state_db():
+    """初始化 state.db 结构"""
     ensure_dirs()
     conn = sqlite3.connect(str(STATE_DB))
     cur = conn.cursor()
@@ -134,9 +178,9 @@ def ensure_state_db():
       hits_total INTEGER DEFAULT 0
     )""")
 
-    # bans table records both temp and permanent
-    # expires_at NULL means permanent
-    # kind: 'temp' or 'perm'
+    # bans 表：记录临时/永久封禁
+    # expires_at 为 NULL 表示永久封禁
+    # kind: 'temp' 或 'perm'
     cur.execute("""
     CREATE TABLE IF NOT EXISTS bans(
       ip TEXT PRIMARY KEY,
@@ -153,6 +197,7 @@ def ensure_state_db():
     conn.close()
 
 def get_meta(k: str, default: str = "0") -> str:
+    """读取 meta 键值"""
     conn = sqlite3.connect(str(STATE_DB))
     cur = conn.cursor()
     cur.execute("SELECT v FROM meta WHERE k=?", (k,))
@@ -161,18 +206,22 @@ def get_meta(k: str, default: str = "0") -> str:
     return row[0] if row else default
 
 def set_meta(k: str, v: str):
+    """写入 meta 键值"""
     conn = sqlite3.connect(str(STATE_DB))
     cur = conn.cursor()
-    cur.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
+    cur.execute(
+        "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        (k, str(v))
+    )
     conn.commit()
     conn.close()
 
 def update_state_with_events(events):
     """
     events: list[(ts:int, ip:str)]
-    - insert events
-    - update stats
-    - cleanup old events beyond retention
+    - 写入 events
+    - 更新 stats（首次/最后出现/累计次数）
+    - 清理超出 EVENT_RETENTION_DAYS 的旧 events
     """
     if not events:
         return
@@ -202,7 +251,6 @@ def update_state_with_events(events):
                 (first_seen, last_seen, hits_total, ip)
             )
 
-    # cleanup
     keep_from = now_ts() - EVENT_RETENTION_DAYS * 86400
     cur.execute("DELETE FROM events WHERE ts < ?", (keep_from,))
 
@@ -210,18 +258,21 @@ def update_state_with_events(events):
     conn.close()
 
 # =========================
-# Huorong snapshot read
+# 火绒快照读取
 # =========================
 
 def mirror_huorong_db() -> Path:
     """
-    Copy log.db (+ wal/shm if exists) to snapshot folder to avoid lock/disk I/O error.
-    Returns snapshot log.db path.
+    将火绒 log.db（以及 wal/shm）复制到快照目录，避免被占用/锁导致读取失败。
+    并在复制前执行“只保留最近 N 个快照”的清理策略。
+    返回快照中的 log.db 路径。
     """
     if not LOG_DB.exists():
         raise FileNotFoundError(str(LOG_DB))
 
     ensure_dirs()
+    cleanup_snapshots_keep_last_n()
+
     snap = SNAP_DIR / time.strftime("%Y%m%d_%H%M%S")
     snap.mkdir(parents=True, exist_ok=True)
 
@@ -235,16 +286,16 @@ def mirror_huorong_db() -> Path:
 
 def parse_ips_from_detail(detail: str):
     """
-    Return set[str] of attacker IPs.
-    Preferred: json.loads on detail (Huorong stores JSON with double quotes)
-    Fallback: regex scan if it looks like detection=RDP.
+    从火绒 detail 字段解析攻击者 IP，返回 set[str]。
+    优先：json.loads（火绒常见是 JSON 字符串）
+    兜底：正则扫描（仅当检测字段像 RDP 时才扫描，降低误报）
     """
     ips = set()
     if not detail:
         return ips
     s = str(detail).strip()
 
-    # JSON path (most common in your samples)
+    # 优先走 JSON
     try:
         obj = json.loads(s)
         d = obj.get("detail", {})
@@ -265,10 +316,9 @@ def parse_ips_from_detail(detail: str):
     except Exception:
         pass
 
-    # Fallback (rare)
+    # 兜底：只在看起来像 RDP 检测时再扫 IP
     if ("detection" not in s) or ("RDP" not in s):
         return set()
-    # reduce false positives
     if '"detection":"RDP"' not in s and "'detection':'RDP'" not in s and "detection\":\"RDP" not in s:
         return set()
 
@@ -278,8 +328,8 @@ def parse_ips_from_detail(detail: str):
 
 def read_new_events_from_snapshot(snapshot_db: Path, last_ts: int):
     """
-    Incremental ingest: ts > last_ts, fname='rlogin'
-    Return (events, max_ts_seen)
+    增量读取：只取 ts > last_ts 且 fname='rlogin' 的记录
+    返回 (events, max_ts_seen)
     """
     conn = sqlite3.connect(str(snapshot_db))
     cur = conn.cursor()
@@ -313,19 +363,21 @@ def read_new_events_from_snapshot(snapshot_db: Path, last_ts: int):
     return out, max_ts
 
 # =========================
-# Firewall operations
+# 防火墙操作
 # =========================
 
 def fw_rule_exists(display_name: str) -> bool:
+    """判断防火墙规则是否存在"""
     p = run_ps(f"Get-NetFirewallRule -DisplayName '{display_name}' -ErrorAction SilentlyContinue | Select -First 1")
     return bool(p.stdout.strip())
 
 def fw_remove_rule(display_name: str) -> bool:
+    """删除防火墙规则"""
     p = run_ps(f"Get-NetFirewallRule -DisplayName '{display_name}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule")
     return p.returncode == 0
 
 def fw_create_block_rule_single_ip(ip: str, display_name: str) -> bool:
-    # Block inbound from remote IP
+    """创建单 IP 入站拦截规则"""
     cmd = (
         f"New-NetFirewallRule -DisplayName '{display_name}' "
         f"-Direction Inbound -Action Block -RemoteAddress {ip} -Profile Any"
@@ -335,19 +387,19 @@ def fw_create_block_rule_single_ip(ip: str, display_name: str) -> bool:
 
 def fw_upsert_permanent_pool_rule(ips):
     """
-    Create or update ONE aggregated rule:
-      DisplayName: RDPGuard-Blocked-IP-Pool
+    创建/更新“永久封禁聚合规则”（一个规则合并很多 IP）：
+      DisplayName: RULE_POOL_NAME
       RemoteAddress: ip1,ip2,...
-    This is the key optimization.
+
+    注意：防火墙存在长度/数量限制；若失败则自动拆分为多个规则：RULE_POOL_NAME-1/-2/...
     """
-    # Firewall limits exist; for very large lists you may need multiple pool rules.
-    # In practice, this still handles hundreds/thousands well; if it fails we split.
     ips = sorted(set(ips))
     if not ips:
         return True
 
-    # try one rule
     remote = ",".join(ips)
+
+    # 尝试单规则
     if not fw_rule_exists(RULE_POOL_NAME):
         cmd = (
             f"New-NetFirewallRule -DisplayName '{RULE_POOL_NAME}' "
@@ -357,47 +409,46 @@ def fw_upsert_permanent_pool_rule(ips):
         if p.returncode == 0:
             return True
     else:
-        # update existing rule
         cmd = f"Set-NetFirewallRule -DisplayName '{RULE_POOL_NAME}' -RemoteAddress {remote}"
         p = run_ps(cmd)
         if p.returncode == 0:
             return True
 
-    # fallback: split into chunks if one rule is too big
-    # We create multiple rules: RDPGuard-Blocked-IP-Pool-1, -2, ...
-    # First remove original pool if exists to avoid confusion.
+    # 单规则失败：拆分（先移除主规则，避免混乱）
     if fw_rule_exists(RULE_POOL_NAME):
         fw_remove_rule(RULE_POOL_NAME)
 
-    chunk_size = 500  # conservative
+    chunk_size = 500  # 保守一点，避免 PowerShell 参数过长
     ok_all = True
     for i in range(0, len(ips), chunk_size):
-        chunk = ips[i:i+chunk_size]
-        name = f"{RULE_POOL_NAME}-{(i//chunk_size)+1}"
-        remote = ",".join(chunk)
+        chunk = ips[i:i + chunk_size]
+        name = f"{RULE_POOL_NAME}-{(i // chunk_size) + 1}"
+        remote_chunk = ",".join(chunk)
+
         if fw_rule_exists(name):
-            p = run_ps(f"Set-NetFirewallRule -DisplayName '{name}' -RemoteAddress {remote}")
+            p = run_ps(f"Set-NetFirewallRule -DisplayName '{name}' -RemoteAddress {remote_chunk}")
         else:
             p = run_ps(
                 f"New-NetFirewallRule -DisplayName '{name}' -Direction Inbound -Action Block "
-                f"-RemoteAddress {remote} -Profile Any"
+                f"-RemoteAddress {remote_chunk} -Profile Any"
             )
         if p.returncode != 0:
             ok_all = False
+
     return ok_all
 
 # =========================
-# Ban decision engine
+# 封禁决策引擎
 # =========================
 
 def decide_and_apply_bans():
     """
-    - Unban expired temp rules
-    - Compute windows counts (10m/1d) from events
-    - Permanent bans based on stats.hits_total >= THRESH_TOTAL
-      -> aggregated firewall pool rule(s), record in bans(kind='perm')
-    - Temporary bans based on windows thresholds for IPs not permanently banned
-      -> per-IP firewall rules, record in bans(kind='temp')
+    - 自动解封已到期的临时封禁规则
+    - 统计窗口命中次数（近 10 分钟、近 24 小时）
+    - 永久封禁：stats.hits_total >= THRESH_TOTAL
+      -> 更新聚合规则，并在 bans(kind='perm') 记录
+    - 临时封禁：未永久封禁的 IP，满足窗口阈值
+      -> 创建单 IP 防火墙规则，记录 bans(kind='temp')
     """
     now = now_ts()
     t10 = now - 10 * 60
@@ -406,7 +457,7 @@ def decide_and_apply_bans():
     conn = sqlite3.connect(str(STATE_DB))
     cur = conn.cursor()
 
-    # 1) Unban expired temp bans
+    # 1) 解封到期的临时封禁
     cur.execute("""
       SELECT ip, rule_name FROM bans
       WHERE kind='temp' AND expires_at IS NOT NULL AND expires_at <= ?
@@ -414,10 +465,10 @@ def decide_and_apply_bans():
     expired = cur.fetchall()
     for ip, rule_name in expired:
         fw_remove_rule(rule_name)
-        append_log(f"UNBAN {ip} (expired)")
+        append_log(f"解封 {ip}（临时封禁到期）")
         cur.execute("DELETE FROM bans WHERE ip=?", (ip,))
 
-    # 2) Compute window hits for last 24h (10m / 1d)
+    # 2) 统计近 24h 的窗口命中（同时得出近 10m 和近 1d）
     cur.execute("""
       SELECT ip,
              SUM(CASE WHEN ts >= ? THEN 1 ELSE 0 END) AS hits_10m,
@@ -428,67 +479,65 @@ def decide_and_apply_bans():
     """, (t10, t1d, t1d))
     window = {ip: (h10 or 0, h1d or 0) for ip, h10, h1d in cur.fetchall()}
 
-    # 3) Total hits
+    # 3) 累计命中
     cur.execute("SELECT ip, hits_total FROM stats")
     totals = {ip: (hits_total or 0) for ip, hits_total in cur.fetchall()}
 
-    # 4) Current bans
+    # 4) 已封禁映射
     cur.execute("SELECT ip, kind FROM bans")
     banned_map = {ip: kind for ip, kind in cur.fetchall()}
 
-    # ---- Permanent ban set ----
+    # 5) 永久封禁集合（累计达到阈值）
     perm_ips = [ip for ip, total in totals.items() if total >= THRESH_TOTAL]
-    # Apply aggregated firewall rule(s)
     if perm_ips:
         ok = fw_upsert_permanent_pool_rule(perm_ips)
         if ok:
-            # record them in bans(kind='perm')
             for ip in perm_ips:
                 if banned_map.get(ip) == "perm":
                     continue
-                # for permanent bans we do not create per-ip rule; rule_name stores pool name
+                # 永久封禁不创建 per-ip 规则，rule_name 记录聚合规则名
                 cur.execute("""
                   INSERT OR REPLACE INTO bans(ip, rule_name, kind, banned_at, expires_at, reason)
                   VALUES (?,?,?,?,?,?)
-                """, (ip, RULE_POOL_NAME, "perm", now, None, f"total>={THRESH_TOTAL}"))
-            append_log(f"PERM_POOL updated, perm_ips={len(perm_ips)}")
+                """, (ip, RULE_POOL_NAME, "perm", now, None, f"累计>={THRESH_TOTAL}"))
+            append_log(f"已更新永久封禁聚合规则，永久封禁 IP 数：{len(perm_ips)}")
         else:
-            append_log("ERROR: failed to update permanent pool rule(s)")
+            append_log("错误：更新永久封禁聚合规则失败（可能是防火墙限制/权限问题）")
 
-    # ---- Temporary bans (only for not permanently banned) ----
+    # 6) 临时封禁（只对非永久封禁、且未封禁的 IP 生效）
     new_temp = []
     for ip, total in totals.items():
         if total >= THRESH_TOTAL:
-            continue  # perm already
+            continue
         if ip in banned_map:
-            continue  # already banned (temp)
+            continue
 
         h10, h1d = window.get(ip, (0, 0))
         reason = None
         expires_at = None
 
         if h1d >= THRESH_1D:
-            reason = f"1d>={THRESH_1D}"
+            reason = f"近24小时>={THRESH_1D}"
             expires_at = now + BAN_1D_DAYS * 86400
         elif h10 >= THRESH_10M:
-            reason = f"10m>={THRESH_10M}"
+            reason = f"近10分钟>={THRESH_10M}"
             expires_at = now + BAN_10M_HOURS * 3600
 
         if reason:
             rule_name = f"{RULE_PREFIX_TEMP} {ip}"
             new_temp.append((ip, rule_name, now, expires_at, reason))
 
-    # Apply temp bans per IP (limited batch to avoid long runs)
-    # You can increase this if you want.
+    # 批量应用临时封禁：限制一次最多处理数量，避免运行时间过长
     max_apply = 200
     applied = 0
     for ip, rule_name, banned_at, expires_at, reason in new_temp:
         if applied >= max_apply:
             break
+
         if not fw_rule_exists(rule_name):
             ok = fw_create_block_rule_single_ip(ip, rule_name)
             if not ok:
-                append_log(f"TEMP BAN FAIL {ip} ({reason})")
+                append_log(f"临时封禁失败 {ip}（原因：{reason}）")
                 continue
 
         cur.execute("""
@@ -496,24 +545,22 @@ def decide_and_apply_bans():
           VALUES (?,?,?,?,?,?)
         """, (ip, rule_name, "temp", banned_at, expires_at, reason))
 
-        if expires_at:
-            append_log(f"TEMP BAN {ip} ({reason}) until {ts_to_local_str(expires_at)}")
-        else:
-            append_log(f"TEMP BAN {ip} ({reason})")
+        append_log(f"临时封禁 {ip}（{reason}），到期：{ts_to_local_str(expires_at)}")
         applied += 1
 
     conn.commit()
     conn.close()
 
 # =========================
-# Report
+# 报表生成
 # =========================
 
 def generate_report():
+    """生成 report.html（可选生成图表 top_ips.png / daily_hits.png）"""
     conn = sqlite3.connect(str(STATE_DB))
     cur = conn.cursor()
 
-    # top 20
+    # Top 20
     cur.execute("""
       SELECT ip, hits_total, first_seen, last_seen
       FROM stats
@@ -522,7 +569,7 @@ def generate_report():
     """)
     top = cur.fetchall()
 
-    # bans (recent 200)
+    # 封禁记录（最近 200 条）
     cur.execute("""
       SELECT ip, kind, reason, banned_at, expires_at
       FROM bans
@@ -531,7 +578,7 @@ def generate_report():
     """)
     bans = cur.fetchall()
 
-    # daily hits (retention window)
+    # 每日命中（近 EVENT_RETENTION_DAYS 天）
     now = now_ts()
     from_ts = now - EVENT_RETENTION_DAYS * 86400
     cur.execute("""
@@ -545,7 +592,7 @@ def generate_report():
 
     conn.close()
 
-    # optional charts
+    # 可选图表（有 matplotlib 才画）
     plt = None
     try:
         import matplotlib.pyplot as plt  # type: ignore
@@ -553,23 +600,23 @@ def generate_report():
         plt = None
 
     if plt:
-        # Top IP barh
+        # Top IP 横向柱状图
         ips = [r[0] for r in top][::-1]
         hits = [r[1] for r in top][::-1]
         plt.figure(figsize=(10, 6))
         plt.barh(ips, hits)
-        plt.xlabel("hits_total")
+        plt.xlabel("累计命中次数（hits_total）")
         plt.tight_layout()
         plt.savefig(str(CHART_TOP), dpi=160)
         plt.close()
 
-        # Daily line
+        # 每日趋势折线
         days = [r[0] for r in daily]
         dh = [r[1] for r in daily]
         plt.figure(figsize=(10, 4))
         plt.plot(days, dh, marker="o")
         plt.xticks(rotation=30, ha="right")
-        plt.ylabel("hits")
+        plt.ylabel("命中次数（hits）")
         plt.tight_layout()
         plt.savefig(str(CHART_DAILY), dpi=160)
         plt.close()
@@ -613,6 +660,7 @@ img{{max-width:100%;border-radius:10px;border:1px solid #223049;background:#0b0f
 <div class="card">
   <h2>永久封禁聚合规则</h2>
   <div class="small">规则名：<span class="code">{RULE_POOL_NAME}</span>（如过大将自动拆分为 -1/-2/...）</div>
+  <div class="small">快照保留：最近 <span class="code">{SNAPSHOT_KEEP_MAX}</span> 个</div>
 </div>
 
 <div class="card">
@@ -637,14 +685,14 @@ img{{max-width:100%;border-radius:10px;border:1px solid #223049;background:#0b0f
   </table>
 </div>
 
-<div class="small">日志：{LOG_FILE}</div>
+<div class="small">日志文件：{LOG_FILE}</div>
 </body>
 </html>
 """
     REPORT_HTML.write_text(html, encoding="utf-8", errors="ignore")
 
 # =========================
-# Main
+# 主程序
 # =========================
 
 def main():
@@ -654,32 +702,32 @@ def main():
 
     ensure_state_db()
 
-    # Incremental cursor
+    # 增量游标：上次读到的最大 ts
     last_ts = int(get_meta("last_ts", "0"))
 
-    # Mirror Huorong DB
+    # 创建火绒 DB 快照
     try:
         snap_db = mirror_huorong_db()
     except Exception as e:
-        append_log(f"ERROR: mirror huorong db failed: {e}")
+        append_log(f"错误：复制火绒数据库失败：{e}")
         return
 
-    # Ingest new events
+    # 增量读取新事件
     events, max_ts = read_new_events_from_snapshot(snap_db, last_ts)
 
     if events:
         update_state_with_events(events)
         set_meta("last_ts", str(max_ts))
-        append_log(f"INGEST {len(events)} new events, ts <= {max_ts}")
+        append_log(f"已导入 {len(events)} 条新事件，最大 ts={max_ts}")
     else:
-        append_log("INGEST 0 new events")
+        append_log("未导入新事件（0）")
 
-    # Apply bans
+    # 应用封禁/解封
     decide_and_apply_bans()
 
-    # Report
+    # 生成报表
     generate_report()
-    append_log(f"REPORT {REPORT_HTML}")
+    append_log(f"已生成报表：{REPORT_HTML}")
 
 if __name__ == "__main__":
     main()
