@@ -599,13 +599,49 @@ def generate_report():
     except Exception:
         plt = None
 
+    use_cn = True  # 默认尝试中文；若找不到中文字体会切换为英文
+
     if plt:
+        # ===== 解决中文字体缺失：自动选择可用中文字体；否则退回英文 =====
+        try:
+            from matplotlib import rcParams
+            from matplotlib import font_manager
+
+            def pick_cjk_font():
+                # 常见中文字体候选（按优先级）
+                candidates = [
+                    "Microsoft YaHei",
+                    "SimHei",
+                    "Microsoft JhengHei",
+                    "PingFang SC",
+                    "Noto Sans CJK SC",
+                    "Source Han Sans SC",
+                    "WenQuanYi Micro Hei",
+                ]
+                available = {f.name for f in font_manager.fontManager.ttflist}
+                for name in candidates:
+                    if name in available:
+                        return name
+                return None
+
+            cjk = pick_cjk_font()
+            if cjk:
+                rcParams["font.family"] = cjk
+                rcParams["axes.unicode_minus"] = False  # 解决负号显示问题
+                use_cn = True
+            else:
+                # 没有中文字体：退回英文，避免中文缺字 warning
+                use_cn = False
+        except Exception:
+            # 任何字体设置异常：也退回英文
+            use_cn = False
+
         # Top IP 横向柱状图
         ips = [r[0] for r in top][::-1]
         hits = [r[1] for r in top][::-1]
         plt.figure(figsize=(10, 6))
         plt.barh(ips, hits)
-        plt.xlabel("累计命中次数（hits_total）")
+        plt.xlabel("累计命中次数（hits_total）" if use_cn else "Total hits (hits_total)")
         plt.tight_layout()
         plt.savefig(str(CHART_TOP), dpi=160)
         plt.close()
@@ -616,7 +652,7 @@ def generate_report():
         plt.figure(figsize=(10, 4))
         plt.plot(days, dh, marker="o")
         plt.xticks(rotation=30, ha="right")
-        plt.ylabel("命中次数（hits）")
+        plt.ylabel("命中次数（hits）" if use_cn else "Hits")
         plt.tight_layout()
         plt.savefig(str(CHART_DAILY), dpi=160)
         plt.close()
