@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.pyc
+*$py.class
+*.so
+*.pyo
+*.pyd
+*.pyi
+*.py[co]
+*.pyw
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+*.exe
+*.dll
+*.pdb
+*.obj
+*.lib
+*.exp
+*.ilk
+*.manifest
+*.res
+*.tmp
+*.log
+
+# Windows 生成文件
+Thumbs.db
+.DS_Store
+desktop.ini
+$RECYCLE.BIN/
+
+
+# 火绒日志快照（临时复制，不应提交）
+log.db
+log.db-wal
+log.db-shm
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+*.swo
+*.swn
+*.sublime-project
+*.sublime-workspace
+*.vscode/
+*.ipynb_checkpoints/
+
+# 其他
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+*.env
