@@ -14,8 +14,12 @@ RDPGuard - RDP 爆破检测与自动封禁工具
 - 自动通过 Windows 防火墙封禁
   * 永久封禁：使用“一个聚合规则”合并大量 IP（性能更好；过大自动拆分 -1/-2/...）
   * 临时封禁：按 IP 单独规则（到期自动解封）
-- 生成 report.html（若安装 matplotlib 可额外生成图表）
 - 采集 Windows 防火墙 DROP 日志（pfirewall.log），用于验证封禁后仍在尝试的攻击源
+- 生成 report.html（若安装 matplotlib 可额外生成图表）
+- 导出 CSV：
+  * attacks_24h_top100.csv：近24小时攻击IP Top100（带封禁状态）
+  * drops_24h_top100.csv：近24小时 DROP Top100（RDP端口）
+  * bans_recent_200.csv：最近200条封禁记录
 - 自主轮询：默认每 5 分钟执行一轮（可配置）
 
 必须使用【管理员】运行。
@@ -26,6 +30,7 @@ import re
 import sys
 import time
 import json
+import csv
 import shutil
 import sqlite3
 import subprocess
@@ -48,9 +53,13 @@ BASE = Path(r"C:\ProgramData\RDPGuard")
 STATE_DB = BASE / "state.db"
 LOG_FILE = BASE / "rdpguard.log"
 REPORT_HTML = BASE / "report.html"
-CHART_TOP = BASE / "top_ips.png"
 CHART_DAILY = BASE / "daily_hits.png"
 SNAP_DIR = BASE / "snapshots"
+
+# 导出 CSV 文件
+CSV_ATTACKS_24H = BASE / "attacks_24h_top100.csv"
+CSV_DROPS_24H = BASE / "drops_24h_top100.csv"
+CSV_BANS_200 = BASE / "bans_recent_200.csv"
 
 # 快照保留策略：只保留最近 N 个快照（避免无限增长）
 SNAPSHOT_KEEP_MAX = 50  # 每 5 分钟跑一次，保留 50~100 很够用
@@ -69,7 +78,7 @@ BAN_10M_HOURS = 24
 THRESH_1D = 20
 BAN_1D_DAYS = 7
 
-THRESH_TOTAL = 100  # 达到累计次数则永久封禁
+THRESH_TOTAL = 100  # 达到累计次数则永久封禁（用于封禁决策；报表不再展示“累计 Top IP”）
 
 # 轮询执行（自主运行）
 POLL_SECONDS = 300  # 5分钟
@@ -80,6 +89,9 @@ ENABLE_FW_DROP_LOG = True
 FW_LOG = Path(r"C:\Windows\System32\LogFiles\Firewall\pfirewall.log")
 FW_LOG_MAX_KB = 16384  # 16MB
 RDP_PORT = 3389  # 你的 RDP 端口（默认 3389；如果你改了端口，这里要同步）
+
+# 报表列表展示 Top N
+TOP_N = 100
 
 # IP 提取正则
 RE_IP = re.compile(
@@ -159,10 +171,35 @@ def cleanup_snapshots_keep_last_n():
             append_log(f"SNAP_CLEAN 删除失败：{p.name}，错误：{e}")
 
 def acquire_lock():
-    """简单锁文件：防止你手误启动两份导致重复跑"""
+    """
+    简单锁文件：防止你手误启动两份导致重复跑。
+    处理“上次异常退出遗留锁”的情况：如果 PID 不存在就自动清掉锁。
+    """
     ensure_dirs()
+
     if LOCK_FILE.exists():
-        raise RuntimeError(f"检测到锁文件，可能已有实例在运行：{LOCK_FILE}")
+        try:
+            pid = int(LOCK_FILE.read_text(encoding="utf-8", errors="ignore").strip() or "0")
+        except Exception:
+            pid = 0
+
+        # 尝试判断进程是否存在（Windows：tasklist）
+        alive = False
+        if pid > 0:
+            p = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", f"Get-Process -Id {pid} -ErrorAction SilentlyContinue | Select -First 1"],
+                capture_output=True, text=True
+            )
+            alive = bool((p.stdout or "").strip())
+
+        if alive:
+            raise RuntimeError(f"检测到锁文件，可能已有实例在运行：{LOCK_FILE}（pid={pid}）")
+        else:
+            try:
+                LOCK_FILE.unlink()
+            except Exception:
+                pass
+
     LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8", errors="ignore")
 
 def release_lock():
@@ -172,6 +209,18 @@ def release_lock():
             LOCK_FILE.unlink()
     except Exception:
         pass
+
+def write_csv(path: Path, header, rows):
+    """写 CSV（UTF-8 带 BOM，方便 Excel 直接打开）"""
+    ensure_dirs()
+    try:
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for r in rows:
+                w.writerow(r)
+    except Exception as e:
+        append_log(f"CSV 写入失败：{path}，错误：{e}")
 
 # =========================
 # 数据库：state.db
@@ -403,7 +452,7 @@ def read_new_events_from_snapshot(snapshot_db: Path, last_ts: int):
 def fw_rule_exists(display_name: str) -> bool:
     """判断防火墙规则是否存在"""
     p = run_ps(f"Get-NetFirewallRule -DisplayName '{display_name}' -ErrorAction SilentlyContinue | Select -First 1")
-    return bool(p.stdout.strip())
+    return bool((p.stdout or "").strip())
 
 def fw_remove_rule(display_name: str) -> bool:
     """删除防火墙规则"""
@@ -528,7 +577,7 @@ def parse_firewall_drop_log_and_store():
                 if not line or line.startswith("#"):
                     continue
 
-                # 常见格式（Windows 防火墙日志默认字段）：
+                # Windows 防火墙日志默认字段：
                 # date time action protocol src-ip dst-ip src-port dst-port ...
                 parts = line.split()
                 if len(parts) < 8:
@@ -634,7 +683,6 @@ def decide_and_apply_bans():
             for ip in perm_ips:
                 if banned_map.get(ip) == "perm":
                     continue
-                # 永久封禁不创建 per-ip 规则，rule_name 记录聚合规则名
                 cur.execute("""
                   INSERT OR REPLACE INTO bans(ip, rule_name, kind, banned_at, expires_at, reason)
                   VALUES (?,?,?,?,?,?)
@@ -691,66 +739,119 @@ def decide_and_apply_bans():
     conn.close()
 
 # =========================
-# 报表生成（含态势卡片 + 可选图表）
+# 报表生成（含态势卡片 + 图表 + Top100 列表 + CSV 导出）
 # =========================
 
-def generate_report():
-    """生成 report.html（可选生成图表 top_ips.png / daily_hits.png）"""
+def _pick_cjk_font_if_possible():
+    """
+    matplotlib 中文字体自动选择：
+    - 找到就用中文
+    - 找不到就回退英文（避免一堆缺字 warning）
+    返回 use_cn: bool
+    """
+    try:
+        from matplotlib import rcParams
+        from matplotlib import font_manager
+
+        candidates = [
+            "Microsoft YaHei",
+            "SimHei",
+            "Microsoft JhengHei",
+            "PingFang SC",
+            "Noto Sans CJK SC",
+            "Source Han Sans SC",
+            "WenQuanYi Micro Hei",
+        ]
+        available = {f.name for f in font_manager.fontManager.ttflist}
+        for name in candidates:
+            if name in available:
+                rcParams["font.family"] = name
+                rcParams["axes.unicode_minus"] = False
+                return True
+        return False
+    except Exception:
+        return False
+
+def generate_report_and_exports():
+    """生成 report.html（可选生成图表），并导出 CSV"""
     now = now_ts()
     t24 = now - 24 * 3600
     t1h = now - 3600
+    from_ts = now - EVENT_RETENTION_DAYS * 86400
 
     conn = sqlite3.connect(str(STATE_DB))
     cur = conn.cursor()
 
     # ========= 态势卡片指标 =========
 
-    # 近24小时命中
     cur.execute("SELECT COUNT(*) FROM events WHERE ts >= ?", (t24,))
     hits_24h = int(cur.fetchone()[0] or 0)
 
-    # 近24小时攻击IP去重
     cur.execute("SELECT COUNT(DISTINCT ip) FROM events WHERE ts >= ?", (t24,))
     uniq_ips_24h = int(cur.fetchone()[0] or 0)
 
-    # 近1小时活跃攻击源（去重）
     cur.execute("SELECT COUNT(DISTINCT ip) FROM events WHERE ts >= ?", (t1h,))
     active_ips_1h = int(cur.fetchone()[0] or 0)
 
-    # 近24小时新增攻击源（按 stats.first_seen 计算）
     cur.execute("SELECT COUNT(*) FROM stats WHERE first_seen IS NOT NULL AND first_seen >= ?", (t24,))
     new_ips_24h = int(cur.fetchone()[0] or 0)
 
-    # 当前有效临时封禁
     cur.execute("""
       SELECT COUNT(*) FROM bans
       WHERE kind='temp' AND expires_at IS NOT NULL AND expires_at > ?
     """, (now,))
     temp_bans_active = int(cur.fetchone()[0] or 0)
 
-    # 永久封禁总数（数据库记录）
     cur.execute("SELECT COUNT(*) FROM bans WHERE kind='perm'")
     perm_bans_total = int(cur.fetchone()[0] or 0)
 
-    # DROP 近24小时次数
     cur.execute("SELECT COUNT(*) FROM drops WHERE ts >= ?", (t24,))
     drops_24h = int(cur.fetchone()[0] or 0)
 
-    # DROP 近24小时去重 IP 数
     cur.execute("SELECT COUNT(DISTINCT ip) FROM drops WHERE ts >= ?", (t24,))
     drops_ips_24h = int(cur.fetchone()[0] or 0)
 
-    # ========= 明细表：封禁记录（最近 200 条） =========
+    # ========= 近24小时攻击 IP Top100（带封禁状态） =========
+    cur.execute(f"""
+      SELECT e.ip,
+             COUNT(*) AS hits_24h,
+             MIN(e.ts) AS first_ts,
+             MAX(e.ts) AS last_ts,
+             b.kind,
+             b.expires_at
+      FROM events e
+      LEFT JOIN bans b ON b.ip = e.ip
+      WHERE e.ts >= ?
+      GROUP BY e.ip, b.kind, b.expires_at
+      ORDER BY hits_24h DESC, last_ts DESC
+      LIMIT {int(TOP_N)}
+    """, (t24,))
+    attacks_24h_top = cur.fetchall()
+
+    # ========= 近24小时 DROP Top100（RDP端口） =========
+    cur.execute(f"""
+      SELECT d.ip,
+             COUNT(*) AS drops_24h,
+             MIN(d.ts) AS first_ts,
+             MAX(d.ts) AS last_ts
+      FROM drops d
+      WHERE d.ts >= ?
+      GROUP BY d.ip
+      ORDER BY drops_24h DESC, last_ts DESC
+      LIMIT {int(TOP_N)}
+    """, (t24,))
+    drops_24h_top = cur.fetchall()
+
+    # ========= 封禁记录（最近 200 条） =========
     cur.execute("""
       SELECT ip, kind, reason, banned_at, expires_at
       FROM bans
       ORDER BY banned_at DESC
       LIMIT 200
     """)
-    bans = cur.fetchall()
+    bans_200 = cur.fetchall()
 
-    # ========= 时间序列：每日命中（近 EVENT_RETENTION_DAYS 天） =========
-    from_ts = now - EVENT_RETENTION_DAYS * 86400
+    # ========= 每日命中趋势（近 EVENT_RETENTION_DAYS 天） =========
     cur.execute("""
       SELECT date(datetime(ts,'unixepoch','localtime')) AS day, COUNT(*) AS hits
       FROM events
@@ -760,72 +861,66 @@ def generate_report():
     """, (from_ts,))
     daily = cur.fetchall()
 
-    # ========= Top 20（累计命中，仍保留，后续你想删可以一键删掉这块） =========
-    cur.execute("""
-      SELECT ip, hits_total, first_seen, last_seen
-      FROM stats
-      ORDER BY hits_total DESC
-      LIMIT 20
-    """)
-    top = cur.fetchall()
-
     conn.close()
 
-    # ========= 可选图表（有 matplotlib 才画） =========
+    # ========= 导出 CSV =========
+
+    def fmt_ts(x):
+        if x is None:
+            return ""
+        return ts_to_local_str(int(x))
+
+    def fmt_exp(kind, exp):
+        if kind is None:
+            return ""
+        if kind == "perm":
+            return "永久"
+        if exp is None:
+            return ""
+        return ts_to_local_str(int(exp))
+
+    # attacks_24h_top100.csv
+    attack_rows_csv = [
+        [ip, hits, fmt_ts(first_ts), fmt_ts(last_ts), (kind or ""), fmt_exp(kind, expires_at)]
+        for ip, hits, first_ts, last_ts, kind, expires_at in attacks_24h_top
+    ]
+    write_csv(
+        CSV_ATTACKS_24H,
+        ["ip", "hits_24h", "first_seen_24h", "last_seen_24h", "ban_kind", "ban_expires"],
+        attack_rows_csv
+    )
+
+    # drops_24h_top100.csv
+    drop_rows_csv = [
+        [ip, cnt, fmt_ts(first_ts), fmt_ts(last_ts)]
+        for ip, cnt, first_ts, last_ts in drops_24h_top
+    ]
+    write_csv(
+        CSV_DROPS_24H,
+        ["ip", "drops_24h", "first_drop_24h", "last_drop_24h"],
+        drop_rows_csv
+    )
+
+    # bans_recent_200.csv
+    bans_rows_csv = [
+        [ip, kind, reason, fmt_ts(banned_at), (fmt_ts(expires_at) if expires_at is not None else ("永久" if kind == "perm" else ""))]
+        for ip, kind, reason, banned_at, expires_at in bans_200
+    ]
+    write_csv(
+        CSV_BANS_200,
+        ["ip", "kind", "reason", "banned_at", "expires_at"],
+        bans_rows_csv
+    )
+
+    # ========= 可选图表（每日趋势） =========
     plt = None
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except Exception:
         plt = None
 
-    use_cn = True  # 默认尝试中文；若找不到中文字体会切换为英文
-
     if plt:
-        # 解决中文字体缺失：自动选择可用中文字体；否则退回英文
-        try:
-            from matplotlib import rcParams
-            from matplotlib import font_manager
-
-            def pick_cjk_font():
-                candidates = [
-                    "Microsoft YaHei",
-                    "SimHei",
-                    "Microsoft JhengHei",
-                    "PingFang SC",
-                    "Noto Sans CJK SC",
-                    "Source Han Sans SC",
-                    "WenQuanYi Micro Hei",
-                ]
-                available = {f.name for f in font_manager.fontManager.ttflist}
-                for name in candidates:
-                    if name in available:
-                        return name
-                return None
-
-            cjk = pick_cjk_font()
-            if cjk:
-                rcParams["font.family"] = cjk
-                rcParams["axes.unicode_minus"] = False
-                use_cn = True
-            else:
-                use_cn = False
-        except Exception:
-            use_cn = False
-
-        # Top IP 横向柱状图（累计）
-        try:
-            ips = [r[0] for r in top][::-1]
-            hits = [r[1] for r in top][::-1]
-            plt.figure(figsize=(10, 6))
-            plt.barh(ips, hits)
-            plt.xlabel("累计命中次数（hits_total）" if use_cn else "Total hits (hits_total)")
-            plt.tight_layout()
-            plt.savefig(str(CHART_TOP), dpi=160)
-            plt.close()
-        except Exception:
-            pass
-
-        # 每日趋势折线
+        use_cn = _pick_cjk_font_if_possible()
         try:
             days = [r[0] for r in daily]
             dh = [r[1] for r in daily]
@@ -839,17 +934,26 @@ def generate_report():
         except Exception:
             pass
 
-    def fmt_ts(x):
-        if x is None:
-            return "-"
-        return ts_to_local_str(int(x))
+    # ========= HTML 表格渲染 =========
 
-    ban_rows = "\n".join(
-        f"<tr><td>{ip}</td><td>{kind}</td><td>{reason}</td><td>{fmt_ts(bat)}</td><td>{fmt_ts(exp)}</td></tr>"
-        for ip, kind, reason, bat, exp in bans
+    bans_rows_html = "\n".join(
+        f"<tr><td>{ip}</td><td>{kind}</td><td>{reason}</td><td>{fmt_ts(bat) or '-'}</td>"
+        f"<td>{(fmt_ts(exp) if exp is not None else ('永久' if kind=='perm' else '-'))}</td></tr>"
+        for ip, kind, reason, bat, exp in bans_200
     )
 
-    # ========= HTML：态势卡片 =========
+    attacks_rows_html = "\n".join(
+        f"<tr><td>{ip}</td><td>{hits}</td><td>{fmt_ts(first_ts) or '-'}</td><td>{fmt_ts(last_ts) or '-'}</td>"
+        f"<td>{(kind or '-')}</td><td>{(fmt_exp(kind, expires_at) or '-')}</td></tr>"
+        for ip, hits, first_ts, last_ts, kind, expires_at in attacks_24h_top
+    )
+
+    drops_rows_html = "\n".join(
+        f"<tr><td>{ip}</td><td>{cnt}</td><td>{fmt_ts(first_ts) or '-'}</td><td>{fmt_ts(last_ts) or '-'}</td></tr>"
+        for ip, cnt, first_ts, last_ts in drops_24h_top
+    )
+
+    # ========= HTML 输出 =========
     html = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -871,9 +975,10 @@ h1,h2,h3{{margin:.4em 0}}
 .kpi .value{{font-size:28px;font-weight:700;margin-top:6px}}
 .kpi .hint{{font-size:12px;color:var(--muted);margin-top:6px}}
 table{{width:100%;border-collapse:collapse}}
-th,td{{border-bottom:1px solid var(--border);padding:8px;text-align:left;font-size:14px}}
+th,td{{border-bottom:1px solid var(--border);padding:8px;text-align:left;font-size:14px;vertical-align:top}}
 img{{max-width:100%;border-radius:10px;border:1px solid var(--border);background:var(--bg)}}
 .code{{font-family:Consolas,monospace}}
+.badge{{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;font-size:12px;color:var(--muted)}}
 @media (max-width: 900px) {{
   .grid{{grid-template-columns:1fr}}
 }}
@@ -881,7 +986,7 @@ img{{max-width:100%;border-radius:10px;border:1px solid var(--border);background
 </head>
 <body>
 <h1>RDPGuard 面板</h1>
-<div class="small">更新时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div>
+<div class="small">更新时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} <span class="badge">Top {TOP_N}</span></div>
 
 <div class="card">
   <h2>态势概览（近 24 小时 / 近 1 小时）</h2>
@@ -894,7 +999,7 @@ img{{max-width:100%;border-radius:10px;border:1px solid var(--border);background
     <div class="kpi">
       <div class="label">近 24 小时攻击 IP 数（去重）</div>
       <div class="value">{uniq_ips_24h}</div>
-      <div class="hint">同一 IP 多次命中只算 1</div>
+      <div class="hint">衡量“覆盖面”</div>
     </div>
     <div class="kpi">
       <div class="label">活跃攻击源（近 1 小时去重）</div>
@@ -910,7 +1015,7 @@ img{{max-width:100%;border-radius:10px;border:1px solid var(--border);background
     <div class="kpi">
       <div class="label">当前有效封禁（临时）</div>
       <div class="value">{temp_bans_active}</div>
-      <div class="hint">expires_at > now 的 temp</div>
+      <div class="hint">expires_at &gt; now 的 temp</div>
     </div>
     <div class="kpi">
       <div class="label">永久封禁总数（记录）</div>
@@ -931,7 +1036,7 @@ img{{max-width:100%;border-radius:10px;border:1px solid var(--border);background
     <div class="kpi">
       <div class="label">近 24 小时仍在尝试的 IP（去重）</div>
       <div class="value">{drops_ips_24h}</div>
-      <div class="hint">用于判断封禁后是否继续扫描</div>
+      <div class="hint">证明“封禁有效且对方仍在扫”</div>
     </div>
     <div class="kpi">
       <div class="label">快照保留</div>
@@ -939,6 +1044,24 @@ img{{max-width:100%;border-radius:10px;border:1px solid var(--border);background
       <div class="hint">只保留最近 N 个快照目录</div>
     </div>
   </div>
+
+  <div class="small" style="margin-top:10px;">
+    CSV 导出：<span class="code">{CSV_DROPS_24H}</span>
+  </div>
+
+  <table style="margin-top:10px;">
+    <thead><tr><th>IP</th><th>drops_24h</th><th>first_drop</th><th>last_drop</th></tr></thead>
+    <tbody>{drops_rows_html}</tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>近 24 小时攻击 IP 列表（Top {TOP_N}，带封禁状态）</h2>
+  <div class="small">CSV 导出：<span class="code">{CSV_ATTACKS_24H}</span></div>
+  <table style="margin-top:10px;">
+    <thead><tr><th>IP</th><th>hits_24h</th><th>first_seen</th><th>last_seen</th><th>ban_kind</th><th>expires</th></tr></thead>
+    <tbody>{attacks_rows_html}</tbody>
+  </table>
 </div>
 
 <div class="card">
@@ -948,9 +1071,10 @@ img{{max-width:100%;border-radius:10px;border:1px solid var(--border);background
 
 <div class="card">
   <h2>当前封禁（数据库记录，最近 200 条）</h2>
-  <table>
+  <div class="small">CSV 导出：<span class="code">{CSV_BANS_200}</span></div>
+  <table style="margin-top:10px;">
     <thead><tr><th>IP</th><th>kind</th><th>reason</th><th>banned_at</th><th>expires_at</th></tr></thead>
-    <tbody>{ban_rows}</tbody>
+    <tbody>{bans_rows_html}</tbody>
   </table>
 </div>
 
@@ -958,6 +1082,7 @@ img{{max-width:100%;border-radius:10px;border:1px solid var(--border);background
 </body>
 </html>
 """
+    ensure_dirs()
     REPORT_HTML.write_text(html, encoding="utf-8", errors="ignore")
 
 # =========================
@@ -965,17 +1090,19 @@ img{{max-width:100%;border-radius:10px;border:1px solid var(--border);background
 # =========================
 
 def run_once():
-    """执行一轮：快照 -> 导入 -> 封禁 -> DROP 导入 -> 报表"""
+    """执行一轮：快照 -> 导入 -> 封禁 -> DROP 导入 -> 报表 + CSV"""
     ensure_state_db()
 
     last_ts = int(get_meta("last_ts", "0"))
 
+    # 创建火绒 DB 快照
     try:
         snap_db = mirror_huorong_db()
     except Exception as e:
         append_log(f"错误：复制火绒数据库失败：{e}")
         return
 
+    # 增量读取新事件
     events, max_ts = read_new_events_from_snapshot(snap_db, last_ts)
 
     if events:
@@ -985,6 +1112,7 @@ def run_once():
     else:
         append_log("本轮未导入新事件（0）")
 
+    # 封禁/解封
     decide_and_apply_bans()
 
     # 采集 DROP：先确保开启，再增量导入
@@ -994,18 +1122,21 @@ def run_once():
     except Exception as e:
         append_log(f"DROP_LOG 处理异常：{e}")
 
-    generate_report()
+    # 报表 + CSV
+    generate_report_and_exports()
     append_log(f"已生成报表：{REPORT_HTML}")
+    append_log(f"已导出 CSV：{CSV_ATTACKS_24H}")
+    append_log(f"已导出 CSV：{CSV_DROPS_24H}")
+    append_log(f"已导出 CSV：{CSV_BANS_200}")
 
 def main():
     if not is_admin():
         print("请用【管理员】运行：需要创建/删除 Windows 防火墙规则。")
         sys.exit(1)
 
-    # 轮询模式：一直跑
     acquire_lock()
     try:
-        append_log(f"启动轮询：每 {POLL_SECONDS} 秒执行一次")
+        append_log(f"启动轮询：每 {POLL_SECONDS} 秒执行一次（TopN={TOP_N}，RDP_PORT={RDP_PORT}）")
         while True:
             start = time.time()
             try:
